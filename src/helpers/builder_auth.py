@@ -248,7 +248,18 @@ def try_complete_otp_step(
     human_delay(2, 4)
     url = driver.current_url.lower()
     title = (driver.title or "").lower()
+    otp_inputs = [
+        el
+        for el in driver.find_elements(
+            By.CSS_SELECTOR,
+            'input[placeholder*="digit"], input[autocomplete="one-time-code"], input[name*="code"], input[id*="code"], input[inputmode="numeric"]',
+        )
+        if el.is_displayed()
+    ]
     needs_otp = (
+        bool(otp_inputs)
+        or "one-time" in driver.page_source.lower()[:12000]
+        or
         "verify" in url
         or "otp" in url
         or "code" in url
@@ -329,9 +340,13 @@ def verify_account_login(
 
     dismiss_cookie_banner(driver)
 
-    if not click_builder_entry(driver, wait, action="signin"):
-        print("⚠️ 未找到 Sign in 入口，尝试 Sign up 同页入口...")
-        click_builder_entry(driver, wait, action="signup")
+    current_url = (driver.current_url or "").lower()
+    if "signin.aws" not in current_url and "/login" not in current_url:
+        if not click_builder_entry(driver, wait, action="signin"):
+            print("⚠️ 未找到 Sign in 入口，尝试 Sign up 同页入口...")
+            click_builder_entry(driver, wait, action="signup")
+    else:
+        print("ℹ️ 当前已在登录页，跳过入口点击")
 
     human_delay_fn(2, 4)
     if not fill_email_and_continue(driver, wait, email, human_type, human_click):
@@ -339,23 +354,78 @@ def verify_account_login(
         driver.save_screenshot("login_verify_email_fail.png")
         return False
 
-    human_delay_fn(3, 5)
-    try_complete_otp_step(
-        driver, wait, email, email_provider, jwt_token,
-        human_type, human_click, purpose="login",
-    )
+    def _visible_inputs(css: str) -> list:
+        """获取可见输入框列表。"""
+        return [el for el in driver.find_elements(By.CSS_SELECTOR, css) if el.is_displayed()]
 
-    human_delay_fn(2, 4)
-    if driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]'):
-        fill_password_and_continue(
-            driver, wait, password, human_type, human_click,
-            submit_labels=["Sign in", "Continue", "Verify"],
-        )
-    else:
-        try_complete_otp_step(
+    def _click_continue_if_present() -> bool:
+        """尽力点击继续/下一步按钮。"""
+        for xpath in [
+            "//button[contains(., 'Continue')]",
+            "//button[contains(., 'Next')]",
+            "//button[contains(., 'Sign in')]",
+            "//button[@type='submit']",
+        ]:
+            try:
+                btn = driver.find_element(By.XPATH, xpath)
+                if btn.is_displayed():
+                    human_click(driver, btn)
+                    human_delay_fn(2, 4)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _debug_auth_state(stage: str) -> None:
+        """打印登录页关键状态，便于排查失败点。"""
+        try:
+            email_count = len(_visible_inputs('input[type="email"], input[name="email"]'))
+            pwd_count = len(_visible_inputs('input[type="password"]'))
+            otp_count = len(
+                _visible_inputs(
+                    'input[placeholder*="digit"], input[autocomplete="one-time-code"], input[name*="code"], input[id*="code"]'
+                )
+            )
+            print(
+                f"   [debug:{stage}] url={driver.current_url} | title={driver.title} | "
+                f"email={email_count} pwd={pwd_count} otp={otp_count}"
+            )
+        except Exception as e:
+            print(f"   [debug:{stage}] 状态采集失败: {e}")
+
+    for idx in range(5):
+        human_delay_fn(2, 4)
+        _debug_auth_state(f"loop-{idx+1}")
+
+        if is_logged_in_to_builder(driver):
+            break
+
+        pwd_inputs = _visible_inputs('input[type="password"]')
+        if pwd_inputs:
+            fill_password_and_continue(
+                driver, wait, password, human_type, human_click,
+                submit_labels=["Sign in", "Continue", "Verify"],
+            )
+
+        otp_done = try_complete_otp_step(
             driver, wait, email, email_provider, jwt_token,
             human_type, human_click, purpose="login",
         )
+
+        if otp_done and is_logged_in_to_builder(driver):
+            break
+
+        # 仍在邮箱页时，补一次 Continue，避免只填未提交
+        email_inputs = _visible_inputs('input[type="email"], input[name="email"]')
+        if email_inputs:
+            _click_continue_if_present()
+
+        # 若页面无明显输入，尝试再触发一次入口点击
+        if not email_inputs and not pwd_inputs:
+            click_builder_entry(driver, wait, action="signin")
+
+        if is_logged_in_to_builder(driver):
+            break
 
     human_delay_fn(5, 8)
     driver.save_screenshot("login_verify_result.png")

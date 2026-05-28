@@ -11,7 +11,9 @@ import sqlite3
 import sys
 import time
 import uuid
+import imaplib
 from email import policy
+from email.header import decode_header
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +27,13 @@ DB_PATH = Path(os.environ.get("EMAIL_DB_PATH", "/opt/aws-builder-id/data/email.d
 HOST = os.environ.get("EMAIL_API_HOST", "127.0.0.1")
 PORT = int(os.environ.get("EMAIL_API_PORT", "18787"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+GMAIL_BASE_USER = os.environ.get("GMAIL_BASE_USER", "").strip().replace("@gmail.com", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+GMAIL_IMAP_HOST = os.environ.get("GMAIL_IMAP_HOST", "imap.gmail.com")
+GMAIL_IMAP_PORT = int(os.environ.get("GMAIL_IMAP_PORT", "993"))
+GMAIL_FETCH_LIMIT = int(os.environ.get("GMAIL_FETCH_LIMIT", "20"))
+
+_gmail_cache = {"ts": 0.0, "by_alias": {}}
 
 
 def get_secret():
@@ -91,14 +100,34 @@ def create_address(local_part: str):
         conn.commit()
     finally:
         conn.close()
-    token = jwt.encode({"addr": full, "sub": local_part}, get_secret(), algorithm="HS256")
-    return full, token
+    # 用户展示别名（不带 base_user+ 前缀）
+    gmail_alias = f"{local_part}@gmail.com"
+    # 实际收件路由别名（用于 Gmail IMAP 拉取）
+    gmail_route_alias = ""
+    if GMAIL_BASE_USER:
+        gmail_route_alias = f"{GMAIL_BASE_USER}+{local_part}@gmail.com"
+    token = jwt.encode(
+        {
+            "addr": full,
+            "sub": local_part,
+            "gmail_alias": gmail_alias,
+            "gmail_route_alias": gmail_route_alias,
+        },
+        get_secret(),
+        algorithm="HS256",
+    )
+    return full, token, local_part, gmail_alias, gmail_route_alias
 
 
 def decode_token(token: str):
     """解析 JWT，返回邮箱地址。"""
     payload = jwt.decode(token, get_secret(), algorithms=["HS256"])
     return payload.get("addr") or f"{payload.get('sub')}@{DOMAIN}"
+
+
+def decode_token_payload(token: str):
+    """解析 JWT 并返回完整 payload。"""
+    return jwt.decode(token, get_secret(), algorithms=["HS256"])
 
 
 def store_incoming(recipient: str, raw_bytes: bytes):
@@ -146,11 +175,113 @@ def list_mails(full_address: str, limit: int = 20, offset: int = 0):
                 "subject": r["subject"],
                 "from": r["sender"],
                 "source": r["sender"],
+                "created_at": r["created_at"],
+                "channel": "temp",
             }
             for r in rows
         ]
     finally:
         conn.close()
+
+
+def _decode_header_value(raw: str) -> str:
+    """解码邮件头。"""
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    out = []
+    for data, charset in parts:
+        if isinstance(data, bytes):
+            out.append(data.decode(charset or "utf-8", errors="replace"))
+        else:
+            out.append(str(data))
+    return " ".join(out)
+
+
+def _extract_mail_body(msg) -> str:
+    """提取邮件正文（优先 html）。"""
+    html_body = ""
+    text_body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            decoded = payload.decode("utf-8", errors="replace")
+            if ct == "text/html" and not html_body:
+                html_body = decoded
+            elif ct == "text/plain" and not text_body:
+                text_body = decoded
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            text_body = payload.decode("utf-8", errors="replace")
+    return html_body or text_body
+
+
+def list_gmail_mails(alias_address: str, limit: int = 20):
+    """
+    通过 IMAP 读取 Gmail 别名邮箱邮件。
+    仅在配置了 GMAIL_BASE_USER/GMAIL_APP_PASSWORD 时生效。
+    """
+    alias_address = (alias_address or "").strip().lower()
+    if not alias_address or not GMAIL_BASE_USER or not GMAIL_APP_PASSWORD:
+        return []
+
+    now = time.time()
+    # 15 秒内对同一 alias 使用缓存，降低 IMAP 压力
+    if now - _gmail_cache["ts"] < 15 and alias_address in _gmail_cache["by_alias"]:
+        return _gmail_cache["by_alias"][alias_address][:limit]
+
+    result = []
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, GMAIL_IMAP_PORT)
+        mail.login(f"{GMAIL_BASE_USER}@gmail.com", GMAIL_APP_PASSWORD)
+        mail.select("INBOX")
+        _, msg_nums = mail.search(None, "(ALL)")
+        if not msg_nums or not msg_nums[0]:
+            return []
+
+        ids = msg_nums[0].split()
+        for mid in reversed(ids[-max(limit * 3, 30):]):
+            _, data = mail.fetch(mid, "(RFC822)")
+            if not data or not data[0] or not isinstance(data[0], tuple):
+                continue
+            raw = data[0][1]
+            msg = email.message_from_bytes(raw, policy=policy.default)
+            to_field = (msg.get("To") or "").lower()
+            if alias_address not in to_field:
+                continue
+            subject = _decode_header_value(msg.get("Subject"))
+            sender = msg.get("From", "")
+            body = _extract_mail_body(msg)
+            result.append(
+                {
+                    "id": f"gmail-{mid.decode(errors='ignore')}",
+                    "raw": body or raw.decode("utf-8", errors="replace"),
+                    "subject": subject,
+                    "from": sender,
+                    "source": sender,
+                    "created_at": now,
+                    "channel": "gmail_alias",
+                }
+            )
+            if len(result) >= limit:
+                break
+    except Exception as e:
+        print(f"[email-api] Gmail IMAP 读取失败: {e}")
+    finally:
+        try:
+            if mail:
+                mail.logout()
+        except Exception:
+            pass
+
+    _gmail_cache["ts"] = now
+    _gmail_cache["by_alias"][alias_address] = result
+    return result
 
 
 def get_mail(mail_id: str, full_address: str):
@@ -226,8 +357,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/api/new_address":
             data = self._read_json()
             name = str(data.get("name", "")).strip()
-            address, token = create_address(name)
-            self._json(200, {"jwt": token, "address": address})
+            address, token, prefix, gmail_alias, gmail_route_alias = create_address(name)
+            self._json(
+                200,
+                {
+                    "jwt": token,
+                    "address": address,
+                    "prefix": prefix,
+                    "gmail_alias": gmail_alias,
+                    "gmail_route_alias": gmail_route_alias,
+                },
+            )
             return
         self.send_error(404)
 
@@ -264,15 +404,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(401)
             return
         try:
-            addr = decode_token(token)
+            payload = decode_token_payload(token)
+            addr = payload.get("addr") or f"{payload.get('sub')}@{DOMAIN}"
+            gmail_alias = payload.get("gmail_alias", "")
+            gmail_route_alias = payload.get("gmail_route_alias", "")
         except Exception:
             self.send_error(401)
+            return
+        if parsed.path == "/api/me":
+            self._json(
+                200,
+                {
+                    "address": addr,
+                    "gmail_alias": gmail_alias,
+                    "gmail_route_alias": gmail_route_alias,
+                },
+            )
             return
         if parsed.path == "/api/mails":
             qs = parse_qs(parsed.query)
             limit = int(qs.get("limit", ["20"])[0])
             offset = int(qs.get("offset", ["0"])[0])
-            self._json(200, list_mails(addr, limit, offset))
+            channel = (qs.get("channel", ["both"])[0] or "both").lower()
+            mails = []
+            if channel in ("temp", "both"):
+                mails.extend(list_mails(addr, limit, offset))
+            if channel in ("gmail", "gmail_alias", "both"):
+                mails.extend(list_gmail_mails(gmail_route_alias or gmail_alias, limit))
+            mails.sort(key=lambda x: float(x.get("created_at") or 0), reverse=True)
+            self._json(200, mails[:limit])
             return
         m = re.match(r"^/api/mails/([^/]+)$", parsed.path)
         if m:
