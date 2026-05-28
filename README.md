@@ -54,7 +54,9 @@ pip install -r requirements.txt
 
 ### 3. 部署临时邮箱服务
 
-本项目依赖临时邮箱接收 AWS 发送的验证码。推荐使用 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)：
+**VPS 自建邮箱（当前项目默认）**：见 [使用手册-VPS部署.md](docs/使用手册-VPS部署.md)，一键脚本 `.\deploy\Invoke-FullDeploy.ps1`（或 `.\deploy\bin\windows\full-deploy.ps1`），目录说明见 `deploy/README.md`。
+
+也可使用 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)（Cloudflare Workers）：
 
 **部署步骤：**
 

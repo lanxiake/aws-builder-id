@@ -2,7 +2,6 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -13,13 +12,18 @@ import time
 import json
 import os
 from datetime import datetime
-from config import HEADLESS, SLOW_MO
+from config import HEADLESS, SLOW_MO, EMAIL_PROVIDER, VERIFY_LOGIN_AFTER_REGISTER
 from services.email_service import create_temp_email, wait_for_verification_email
+from services.gmail_alias_service import create_gmail_alias_email, wait_for_verification_from_gmail
 from selenium.webdriver.common.action_chains import ActionChains
 from helpers.multilang import lang_selector
 
 
 fake = Faker('en_US')
+
+# ===== 测试开关（用于 A/B 真实邮箱）=====
+TEST_EMAIL = os.environ.get("TEST_EMAIL", "").strip()
+STOP_AFTER_CONTINUE = os.environ.get("STOP_AFTER_CONTINUE", "").strip().lower() in ("1", "true", "yes", "y")
 
 
 def generate_strong_password():
@@ -164,7 +168,8 @@ def run(fixed_account=None):
     # 获取代理（如果启用）- 带测试验证
     proxy_url = None
     if proxy_manager.use_proxy:
-        max_proxy_attempts = 3
+        # 代理可能短时不稳定，增加重试次数
+        max_proxy_attempts = 6
         for proxy_attempt in range(max_proxy_attempts):
             proxy_url = proxy_manager.get_proxy()
             if not proxy_url:
@@ -194,174 +199,118 @@ def run(fixed_account=None):
         print("=" * 50)
     
     # 第一步：准备邮箱
+    gmail_alias_tag = ""
+    email_provider = os.environ.get("EMAIL_PROVIDER", "").strip() or EMAIL_PROVIDER
+
     if fixed_account:
-        # 使用 Outlook (fixed_account 包含完整的 credentials)
         email_address = fixed_account['email']
-        jwt_token = "OUTLOOK_API" 
+        jwt_token = "OUTLOOK_API"
+        email_provider = "outlook"
         print(f"📧 使用固定 Outlook 邮箱: {email_address}")
+    elif TEST_EMAIL:
+        email_address = TEST_EMAIL
+        jwt_token = ""
+        email_provider = "test"
+        print(f"📧 使用真实邮箱测试: {email_address}")
+    elif email_provider == "gmail_alias":
+        email_address, gmail_alias_tag = create_gmail_alias_email()
+        jwt_token = ""
+        print(f"📧 使用 Gmail 别名: {email_address}")
     else:
-        # 使用临时邮箱
-        print("📧 点击创建临时邮箱...")
+        print("📧 点击创建 VPS 临时邮箱...")
         email_address, jwt_token = create_temp_email()
-        email_api_url = None
-    
+        email_provider = "vps"
+    email_api_url = None
+
     if not email_address:
         print("创建邮箱失败，退出")
         return
 
-    # 配置 Chrome 选项 - 增强环境隔离
-    options = uc.ChromeOptions()
-    
-    # 基本设置
-    if HEADLESS:
-        options.add_argument('--headless=new')
-    
-    # 移动设备特殊设置
-    if is_mobile():
-        # 移动设备视口
-        options.add_argument('--window-size=375,812')  # iPhone 尺寸
-        # 模拟触摸事件
-        options.add_argument('--touch-events=enabled')
-    else:
-        # 随机化窗口大小，模拟不同显示器
-        common_resolutions = [
-            "1920,1080", "1366,768", "1536,864", "1440,900", "1280,720"
-        ]
-        chosen_res = random.choice(common_resolutions)
-        options.add_argument(f'--window-size={chosen_res}')
-        options.add_argument('--start-maximized')
-    
-    # 随机化 User-Agent 的 Sec-Ch-Ua (Chrome特定)
-    # options.add_argument(f'--sec-ch-ua-platform="{random.choice(["Windows", "macOS", "Linux"])}"')
-
-    # 地区环境设置（使用检测到的地区）
-    
-    # 地区环境设置（使用检测到的地区）
-    options.add_argument(f'--lang={get_locale_for_region(detected_region)}')
-    options.add_argument(f'--accept-lang={get_accept_language_for_region(detected_region)}')
-    
-    # 增强反检测
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-web-security')
-    options.add_argument('--disable-features=IsolateOrigins,site-per-process')
-    options.add_argument('--disable-site-isolation-trials')
-    
-    # WebGL 和 Canvas 指纹
-    options.add_argument('--enable-webgl')
-    options.add_argument('--enable-features=NetworkService,NetworkServiceInProcess')
-    
-    # 音频设置
-    options.add_argument('--autoplay-policy=no-user-gesture-required')
-    
-    # === 增强隐私保护 ===
-    # 防止 WebRTC 泄露本地 IP
-    options.add_argument('--force-webrtc-ip-handling-policy=default_public_interface_only')
-    options.add_argument('--disable-features=WebRtcHideLocalIpsWithMdns')
-
-    
-    # User-Agent（使用检测到的地区）
-    user_agent = get_user_agent_for_region(detected_region)
-    options.add_argument(f'--user-agent={user_agent}')
-    print(f"User-Agent: {user_agent[:80]}...")
-    
-    # 代理设置 - 使用动态获取的代理
-    if proxy_url:
-        options.add_argument(f'--proxy-server={proxy_url}')
-        print(f"✅ 代理已应用到浏览器")
-
-    
-    # 启动浏览器
-    import tempfile
     import shutil
-    
-    # 创建完全独立的临时用户目录，确保无任何 Cookie/Cache 残留
-    user_data_dir = tempfile.mkdtemp(prefix=f"aws_reg_{random.randint(1000, 9999)}_")
+    from helpers.cloak_driver import (
+        build_chrome_options,
+        create_uc_driver,
+        create_standard_driver,
+        get_driver_mode,
+        is_cloak_enabled,
+        prepare_user_data_dir,
+        resolve_headless,
+    )
+
+    driver_mode = get_driver_mode()
+    use_cloak = driver_mode == "cloak_uc"
+    user_agent = get_user_agent_for_region(detected_region)
+    effective_headless = resolve_headless(HEADLESS)
+    if driver_mode == "uc_plain":
+        engine_label = "system-chromedriver (Selenium)"
+    else:
+        engine_label = "CloakBrowser + UC" if use_cloak else "undetected-chromedriver"
+    print(f"🛡️  浏览器引擎: {engine_label}")
+    print(f"   headless={effective_headless}")
+    print(f"User-Agent: {user_agent[:80]}...")
+
+    user_data_dir = prepare_user_data_dir()
     print(f"📁 创建临时用户目录: {user_data_dir}")
-    
-    # 确保 options 也是新的
-    options.add_argument(f"--user-data-dir={user_data_dir}")
-    
+
+    options, proxy_ext_dir = build_chrome_options(
+        headless=effective_headless,
+        is_mobile=is_mobile(),
+        locale=get_locale_for_region(detected_region),
+        accept_language=get_accept_language_for_region(detected_region),
+        user_agent=user_agent,
+        proxy_url=proxy_url,
+        user_data_dir=user_data_dir,
+        use_cloak=use_cloak,
+        driver_mode=driver_mode,
+    )
+    if proxy_url and proxy_ext_dir:
+        print("✅ 代理已应用（扩展处理账号密码认证）")
+    elif proxy_url:
+        print("✅ 代理已应用到浏览器")
+
     print("\n正在启动浏览器...")
+    if use_cloak:
+        try:
+            from cloakbrowser.download import ensure_binary
+            print(f"   CloakBrowser 二进制: {ensure_binary()}")
+        except Exception as e:
+            print(f"⚠️  CloakBrowser 未就绪: {e}，将回退普通 UC")
+            use_cloak = False
+
     try:
-        # 传递 user_data_dir 给 uc.Chrome
-        driver = uc.Chrome(options=options, user_data_dir=user_data_dir)
+        if driver_mode == "uc_plain":
+            print("🛡️  驱动模式: system chromedriver (Selenium)")
+            driver = create_standard_driver(options, user_data_dir)
+        else:
+            driver = create_uc_driver(options, user_data_dir, use_cloak=use_cloak)
         wait = WebDriverWait(driver, 30)
-        
-        # === 注入硬件指纹混淆 (CPU核心数/内存) ===
-        # 避免所有账号都显示完全相同的硬件配置
-        cores = random.choice([4, 8, 12, 16])
-        memory = random.choice([4, 8, 16, 32])
-        
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": f"""
-                Object.defineProperty(navigator, 'hardwareConcurrency', {{
-                    get: () => {cores}
-                }});
-                Object.defineProperty(navigator, 'deviceMemory', {{
-                    get: () => {memory}
-                }});
-                // 试图干扰 Canvas 能够读取到的 GPU 信息 (不保证 100% 有效但能增加干扰)
-                const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                    // 37445 是 UNMASKED_VENDOR_WEBGL
-                    // 37446 是 UNMASKED_RENDERER_WEBGL
-                    if (parameter === 37445) {{
-                        return 'Intel Inc.';
-                    }}
-                    if (parameter === 37446) {{
-                        return 'Intel Iris OpenGL Engine';
-                    }}
-                    return getParameter(parameter);
-                }};
-            """
-        })
-        
-        # ... (后续代码)
+
+        # CDP 指纹注入已移除：在低配 VPS 上会导致 Chrome 崩溃 (invalid session id)
         
     except Exception as e:
         print(f"❌ 浏览器启动失败: {e}")
-        # 如果启动失败也要清理
         try:
             shutil.rmtree(user_data_dir, ignore_errors=True)
         except: pass
         return
 
-    # === 注入指纹随机化脚本 (暂时禁用以排查检测问题) ===
-    # print("🎭 正在注入指纹随机化...")
-    # from fingerprint import fingerprint_randomizer
-    # fingerprint_randomizer.inject_to_driver(driver)
-    
-    # 设置时区（使用检测到的地区）
-    try:
-        driver.execute_cdp_cmd('Emulation.setTimezoneOverride', {
-            'timezoneId': get_timezone_for_region(detected_region)
-        })
-        print(f"时区已设置为: {get_timezone_for_region(detected_region)}")
-    except Exception as e:
-        print(f"设置时区失败（非关键）: {e}")
-    
-    # 设置地理位置权限（使用检测到的地区）
-    try:
-        # 各地区的大致坐标
-        geo_locations = {
-            'germany': {'latitude': 52.52, 'longitude': 13.405, 'accuracy': 100},
-            'japan': {'latitude': 35.6762, 'longitude': 139.6503, 'accuracy': 100},
-            'usa': {'latitude': 40.7128, 'longitude': -74.0060, 'accuracy': 100}
-        }
-        location = geo_locations.get(detected_region, geo_locations['usa'])
-        driver.execute_cdp_cmd('Emulation.setGeolocationOverride', location)
-        print(f"地理位置已设置")
-    except Exception as e:
-        print(f"设置地理位置失败（非关键）: {e}")
+    # CDP 指纹/时区/地理位置注入已移除：在低配 VPS 上会导致 Chrome 崩溃
+    print(f"🌐 地区: {detected_region.upper()} (CDP 注入已跳过，避免浏览器崩溃)")
 
     try:
         # 第二步：打开 AWS Builder 页面
         print("\n正在打开 AWS Builder 页面...")
         driver.get("https://builder.aws.com/start")
-        human_delay(2, 3)
+        print("等待 SPA 页面渲染...")
+        try:
+            WebDriverWait(driver, 90).until(
+                lambda d: d.title and "builder" in d.title.lower()
+            )
+        except Exception:
+            pass
+        human_delay(3, 5)
         print(f"页面标题: {driver.title}")
+        print(f"当前 URL: {driver.current_url}")
 
         # 处理Cookie弹窗（必须先关闭，否则会遮挡元素）
         print("检查Cookie弹窗...")
@@ -420,7 +369,17 @@ def run(fixed_account=None):
         
         # 点击 Sign up with Builder ID
         print("正在点击 Sign up with Builder ID...")
-        human_delay(4, 6)  # 增加等待时间，确保页面完全加载
+        try:
+            WebDriverWait(driver, 60).until(
+                EC.presence_of_element_located((
+                    By.XPATH,
+                    "//*[contains(., 'Sign up with Builder') or contains(., 'Builder ID')]",
+                ))
+            )
+            print("   注册入口元素已出现")
+        except Exception:
+            print("   ⚠️ 等待注册入口超时，继续尝试...")
+        human_delay(4, 6)
         
         signup_clicked = False
         original_url = driver.current_url
@@ -592,57 +551,66 @@ def run(fixed_account=None):
         print(f"当前页面 URL: {driver.current_url}")
         driver.save_screenshot("screenshot.png")
 
-        # 第四步：填写姓名（带重试）
-        random_name = fake.name()
+        # 第四步：填写姓名（支持「名+姓」两个输入框或单个全名框）
+        first_name = fake.first_name()
+        last_name = fake.last_name()
+        random_name = f"{first_name} {last_name}"
         print(f"正在填写姓名: {random_name}")
-        
-        # 增加一点随机行为
+
         driver.execute_script("window.scrollBy(0, 10)")
         human_delay(0.5, 1)
-        
-        # 更可靠的姓名输入方式
+
         name_input_success = False
         for name_attempt in range(3):
             try:
-                # 等待输入框出现
-                name_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="text"]')))
-                
-                # 点击输入框获取焦点
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="text"]')))
+                text_inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="text"]')
+                visible_inputs = [el for el in text_inputs if el.is_displayed()]
+
+                if len(visible_inputs) >= 2:
+                    print(f"   检测到 {len(visible_inputs)} 个姓名输入框，分别填写名/姓")
+                    for el, value in zip(visible_inputs[:2], [first_name, last_name]):
+                        el.click()
+                        human_delay(0.2, 0.4)
+                        el.send_keys(Keys.CONTROL + "a")
+                        el.send_keys(Keys.DELETE)
+                        human_delay(0.1, 0.2)
+                        human_type(el, value)
+                        human_delay(0.3, 0.6)
+                    name_input_success = True
+                    break
+
+                name_input = visible_inputs[0] if visible_inputs else text_inputs[0]
                 name_input.click()
                 human_delay(0.3, 0.5)
-                
-                # 使用 Ctrl+A 全选然后删除，比 clear() 更可靠
-                from selenium.webdriver.common.keys import Keys
                 name_input.send_keys(Keys.CONTROL + "a")
                 human_delay(0.1, 0.2)
                 name_input.send_keys(Keys.DELETE)
                 human_delay(0.2, 0.4)
-                
-                # 输入姓名
                 human_type(name_input, random_name)
                 human_delay(0.5, 1)
-                
-                # 验证输入是否成功
+
                 actual_value = name_input.get_attribute('value')
                 if actual_value and len(actual_value) > 0:
                     print(f"   输入验证: '{actual_value}'")
                     name_input_success = True
                     break
-                else:
-                    print(f"   输入验证失败，重试...")
-                    
+                print("   输入验证失败，重试...")
+
             except Exception as e:
                 print(f"   姓名输入重试 {name_attempt + 1}/3: {e}")
                 human_delay(1, 2)
-        
+
         if not name_input_success:
             print("⚠️ 姓名输入可能失败，继续尝试...")
 
         driver.save_screenshot("screenshot.png")
         print("已填写姓名")
+        # 填写姓名后稍长停顿，降低提交过快触发风控的概率
+        human_delay(4, 7)
 
         # 点击继续 (多语言兼容) - 带错误检测和多次重试
-        max_continue_attempts = 5  # 增加到5次重试
+        max_continue_attempts = 8
         page_changed = False
         original_url = driver.current_url
         
@@ -651,6 +619,19 @@ def run(fixed_account=None):
             print(f"正在点击继续... (尝试 {continue_attempt + 1}/{max_continue_attempts})")
             
             try:
+                # 偶数次尝试：在姓名框按 Enter 提交（部分页面仅认键盘提交）
+                if continue_attempt % 2 == 1:
+                    try:
+                        name_el = driver.find_element(By.CSS_SELECTOR, 'input[type="text"]')
+                        name_el.send_keys(Keys.ENTER)
+                        human_delay(4, 6)
+                        if driver.current_url != original_url:
+                            print("   ✅ Enter 提交后页面已跳转")
+                            page_changed = True
+                            break
+                    except Exception:
+                        pass
+
                 # 尝试多种方式找到继续按钮
                 continue_btn = None
                 continue_selectors = [
@@ -718,8 +699,12 @@ def run(fixed_account=None):
                             if el.is_displayed():
                                 error_text = el.text.strip()
                                 if error_text and len(error_text) > 5:
-                                    # 排除一些非错误的文本
-                                    if 'required' not in error_text.lower():
+                                    low_err = error_text.lower()
+                                    # 仅识别 AWS 提交失败类弹窗，减少误判
+                                    if (
+                                        'error processing' in low_err
+                                        or 'try again' in low_err
+                                    ) and 'required' not in low_err:
                                         error_found = True
                                         print(f"   ⚠️ 检测到错误: {error_text[:60]}...")
                                         break
@@ -775,16 +760,43 @@ def run(fixed_account=None):
         driver.save_screenshot("screenshot.png")
         print(f"当前页面标题: {driver.title}")
 
+        # （A/B 测试）姓名页 Continue 后直接退出，避免走验证码拉取逻辑
+        if STOP_AFTER_CONTINUE:
+            driver.save_screenshot("ab_continue_result.png")
+            print("\n================ A/B 测试结果 ================")
+            print(f"STOP_AFTER_CONTINUE=1，姓名页 Continue 后直接结束。")
+            print(f"page_changed={page_changed}")
+            print(f"当前 URL: {driver.current_url}")
+            try:
+                import datetime as _dt
+                result = {
+                    "page_changed": page_changed,
+                    "current_url": driver.current_url,
+                    "title": driver.title,
+                    "email": email_address if not fixed_account else fixed_account.get("email", ""),
+                    "ts": _dt.datetime.utcnow().isoformat(),
+                }
+                with open("/tmp/ab_continue_result.json", "w", encoding="utf-8") as f:
+                    f.write(json.dumps(result, ensure_ascii=False))
+            except Exception as e:
+                print(f"⚠️ 写入 ab_continue_result.json 失败: {e}")
+            print("=================================================")
+            return
+
         # 第五步：等待并获取验证码 (优先获取，因为可能页面还没加载完验证码就发过来了)
         print("正在等待验证码邮件...")
         human_delay(3, 5) # 给页面一点加载时间
         
-        # 增加对 JSON 解析错误的保护
         try:
-            # 此时页面应该在要求输入验证码
             if fixed_account:
-                # 适配新的 IMAP OAuth 逻辑，传递完整的账号信息字典
                 verification_code = get_verification_code_from_outlook(fixed_account)
+            elif email_provider == "gmail_alias":
+                verification_code = wait_for_verification_from_gmail(
+                    alias_address=email_address,
+                    timeout=180,
+                    poll_interval=5,
+                    purpose="registration",
+                )
             else:
                 from services.email_service import wait_for_verification_email
                 verification_code = wait_for_verification_email(jwt_token)
@@ -940,8 +952,44 @@ def run(fixed_account=None):
         driver.save_screenshot("final_success.png")
 
         # 保存账号信息 (无论如何都尝试保存，因为可能已经成功)
-        save_account(email_address, password, random_name, jwt_token)
-        print("\n✅ 账号流程结束，已保存信息到 accounts.json")
+        login_verified = None
+        if VERIFY_LOGIN_AFTER_REGISTER and email_address and password:
+            from helpers.builder_auth import verify_account_login
+
+            try:
+                login_verified = verify_account_login(
+                    driver,
+                    wait,
+                    email_address,
+                    password,
+                    email_provider,
+                    jwt_token,
+                    human_delay,
+                    human_type,
+                    human_click,
+                )
+            except Exception as login_err:
+                print(f"⚠️  登录验证异常: {login_err}")
+                login_verified = False
+                try:
+                    driver.save_screenshot("login_verify_error.png")
+                except Exception:
+                    pass
+
+        save_account(
+            email_address,
+            password,
+            random_name,
+            jwt_token,
+            login_verified=login_verified,
+            status="active" if login_verified else "registered",
+        )
+        if login_verified is True:
+            print("\n✅ 注册 + 登录验证均成功，账号可用")
+        elif login_verified is False:
+            print("\n⚠️  注册完成但登录验证未通过，请检查 accounts.jsonl")
+        else:
+            print("\n✅ 账号流程结束，已保存到 accounts.jsonl")
 
     except Exception as e:
         print(f"过程发生错误: {e}")
@@ -981,6 +1029,10 @@ def run(fixed_account=None):
                 time.sleep(1)
                 shutil.rmtree(user_data_dir, ignore_errors=True)
                 print(f"🧹 已清理临时目录")
+        except: pass
+        try:
+            if 'proxy_ext_dir' in locals() and proxy_ext_dir and os.path.isdir(proxy_ext_dir):
+                shutil.rmtree(proxy_ext_dir, ignore_errors=True)
         except: pass
 
 

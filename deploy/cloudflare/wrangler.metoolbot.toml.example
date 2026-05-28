@@ -1,0 +1,25 @@
+# 复制为 deploy/_cf_email/worker/wrangler.toml 后执行 wrangler deploy
+# 前置: npx wrangler login && wrangler d1 create temp_email_metoolbot
+
+name = "temp-email-metoolbot"
+main = "src/worker.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+keep_vars = true
+
+routes = [
+  { pattern = "temp-email-api.metoolbot.top/*", zone_name = "metoolbot.top" }
+]
+
+[vars]
+PREFIX = "tmp"
+DEFAULT_DOMAINS = ["metoolbot.top"]
+DOMAINS = ["metoolbot.top"]
+JWT_SECRET = "请替换为随机长字符串"
+ENABLE_USER_CREATE_EMAIL = true
+ENABLE_USER_DELETE_EMAIL = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "temp_email_metoolbot"
+database_id = "请替换为 wrangler d1 list 中的 uuid"

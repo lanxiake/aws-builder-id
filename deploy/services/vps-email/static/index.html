@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>临时邮箱 · metoolbot.top</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2332; --accent:#3b82f6; --text:#e7ecf3; --muted:#94a3b8; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+    header { padding:1.25rem 1.5rem; border-bottom:1px solid #2d3a4d; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:.5rem; }
+    h1 { margin:0; font-size:1.25rem; }
+    .badge { font-size:.75rem; color:var(--muted); }
+    main { max-width:960px; margin:0 auto; padding:1.5rem; }
+    .card { background:var(--card); border-radius:12px; padding:1.25rem; margin-bottom:1rem; border:1px solid #2d3a4d; }
+    label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:.35rem; }
+    input, button { font:inherit; }
+    input { width:100%; padding:.6rem .75rem; border-radius:8px; border:1px solid #334155; background:#0f172a; color:var(--text); }
+    .row { display:flex; gap:.75rem; flex-wrap:wrap; margin-top:.75rem; }
+    button { padding:.6rem 1rem; border:none; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+    button.secondary { background:#334155; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .addr { word-break:break-all; font-family:monospace; font-size:.95rem; color:#7dd3fc; margin:.5rem 0; }
+    .mail { border-top:1px solid #2d3a4d; padding:1rem 0; }
+    .mail:first-child { border-top:none; padding-top:0; }
+    .mail h3 { margin:0 0 .35rem; font-size:1rem; }
+    .meta { font-size:.8rem; color:var(--muted); }
+    pre { white-space:pre-wrap; word-break:break-word; font-size:.85rem; background:#0f172a; padding:.75rem; border-radius:8px; max-height:240px; overflow:auto; }
+    .empty { color:var(--muted); text-align:center; padding:2rem; }
+    #status { font-size:.85rem; color:var(--muted); margin-top:.5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>临时邮箱</h1>
+    <span class="badge" id="domainBadge">metoolbot.top</span>
+  </header>
+  <main>
+    <section class="card">
+      <label for="prefix">邮箱前缀（留空则随机）</label>
+      <input id="prefix" placeholder="例如 mytest01" />
+      <div class="row">
+        <button type="button" id="btnCreate">创建邮箱</button>
+        <button type="button" class="secondary" id="btnRefresh">刷新邮件</button>
+        <button type="button" class="secondary" id="btnAuto">自动刷新: 关</button>
+      </div>
+      <p id="status"></p>
+      <p class="addr" id="currentAddr" hidden></p>
+      <input type="hidden" id="jwt" />
+    </section>
+    <section class="card">
+      <h2 style="margin:0 0 1rem;font-size:1.1rem;">收件箱</h2>
+      <div id="inbox"><p class="empty">请先创建邮箱</p></div>
+    </section>
+  </main>
+  <script>
+    const LS_KEY = "tempmail_jwt";
+    let autoTimer = null;
+
+    async function api(path, opts = {}) {
+      const jwt = document.getElementById("jwt").value || localStorage.getItem(LS_KEY);
+      const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+      if (jwt) headers["Authorization"] = "Bearer " + jwt;
+      const r = await fetch(path, { ...opts, headers });
+      if (!r.ok) throw new Error(await r.text() || r.statusText);
+      const ct = r.headers.get("content-type") || "";
+      return ct.includes("json") ? r.json() : r.text();
+    }
+
+    function setStatus(msg, ok = true) {
+      const el = document.getElementById("status");
+      el.textContent = msg;
+      el.style.color = ok ? "#94a3b8" : "#f87171";
+    }
+
+    async function loadHealth() {
+      try {
+        const h = await api("/api/health");
+        document.getElementById("domainBadge").textContent = h.domain || "metoolbot.top";
+      } catch (e) { setStatus("API 不可用: " + e.message, false); }
+    }
+
+    async function createAddress() {
+      const name = document.getElementById("prefix").value.trim();
+      setStatus("正在创建...");
+      try {
+        const data = await api("/api/new_address", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        document.getElementById("jwt").value = data.jwt;
+        localStorage.setItem(LS_KEY, data.jwt);
+        document.getElementById("currentAddr").hidden = false;
+        document.getElementById("currentAddr").textContent = data.address;
+        setStatus("邮箱已创建，可刷新收件箱");
+        await refreshInbox();
+      } catch (e) {
+        setStatus("创建失败: " + e.message, false);
+      }
+    }
+
+    async function refreshInbox() {
+      const jwt = document.getElementById("jwt").value || localStorage.getItem(LS_KEY);
+      if (!jwt) { setStatus("请先创建邮箱", false); return; }
+      setStatus("加载邮件...");
+      try {
+        const mails = await api("/api/mails?limit=30");
+        renderInbox(mails);
+        setStatus("已更新 · " + new Date().toLocaleTimeString());
+      } catch (e) {
+        setStatus("加载失败: " + e.message, false);
+        document.getElementById("inbox").innerHTML = '<p class="empty">加载失败</p>';
+      }
+    }
+
+    function renderInbox(mails) {
+      const box = document.getElementById("inbox");
+      if (!mails || !mails.length) {
+        box.innerHTML = '<p class="empty">暂无邮件</p>';
+        return;
+      }
+      box.innerHTML = mails.map((m) => {
+        const subj = (m.subject || "(无主题)").replace(/</g, "&lt;");
+        const from = (m.from || m.source || "").replace(/</g, "&lt;");
+        const body = (m.raw || "").replace(/</g, "&lt;");
+        return `<article class="mail"><h3>${subj}</h3><div class="meta">发件人: ${from}</div><pre>${body}</pre></article>`;
+      }).join("");
+    }
+
+    function toggleAuto() {
+      const btn = document.getElementById("btnAuto");
+      if (autoTimer) {
+        clearInterval(autoTimer);
+        autoTimer = null;
+        btn.textContent = "自动刷新: 关";
+        return;
+      }
+      autoTimer = setInterval(refreshInbox, 5000);
+      btn.textContent = "自动刷新: 开";
+      refreshInbox();
+    }
+
+    document.getElementById("btnCreate").onclick = createAddress;
+    document.getElementById("btnRefresh").onclick = refreshInbox;
+    document.getElementById("btnAuto").onclick = toggleAuto;
+
+    (function init() {
+      const saved = localStorage.getItem(LS_KEY);
+      if (saved) document.getElementById("jwt").value = saved;
+      loadHealth();
+      if (saved) refreshInbox();
+    })();
+  </script>
+</body>
+</html>

@@ -37,3 +37,6 @@ Thumbs.db
 
 # 截图
 *.png
+
+# 部署临时克隆
+deploy/_cf_email/

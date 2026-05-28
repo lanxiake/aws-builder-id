@@ -6,7 +6,7 @@
 import yaml
 from pathlib import Path
 
-config_path = Path(__file__).parent / "config.yaml"
+config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
 
 # 读取配置
 with open(config_path, 'r', encoding='utf-8') as f:

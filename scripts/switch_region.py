@@ -18,7 +18,7 @@ def switch_region(region: str):
         print(f"✅ 可用地区: {', '.join(valid_regions)}")
         return False
     
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
     
     # 读取配置
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -47,7 +47,7 @@ def switch_region(region: str):
 
 def show_current():
     """显示当前地区配置"""
-    config_path = Path(__file__).parent / "config.yaml"
+    config_path = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
     
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
