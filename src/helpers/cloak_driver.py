@@ -174,9 +174,11 @@ def create_standard_driver(
 
 
 def resolve_headless(config_headless: bool) -> bool:
-    """无 DISPLAY 时强制 headless，避免 CloakBrowser 无法启动。"""
+    """Windows 上返回配置值，Linux 上无 DISPLAY 时强制 headless。"""
     if config_headless:
         return True
+    if os.name == "nt":
+        return False  # Windows 总是有 GUI
     display = os.environ.get("DISPLAY", "").strip()
     if not display:
         print("⚠️  未检测到 DISPLAY，自动切换 headless 模式")

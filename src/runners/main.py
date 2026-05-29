@@ -37,15 +37,18 @@ def generate_strong_password():
     return password
 
 
-def save_account(email, password, name, jwt_token=""):
+def save_account(email, password, name, jwt_token="", login_verified=None, status=None):
     """保存账号信息到文件"""
+    if status is None:
+        status = "active" if login_verified else "registered"
     account_info = {
         "email": email,
         "password": password,
         "name": name,
         "jwt_token": jwt_token,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "status": "registered"
+        "login_verified": login_verified,
+        "status": status,
     }
     
     file_path = "accounts.json"
@@ -202,11 +205,15 @@ def run(fixed_account=None):
     gmail_alias_tag = ""
     email_provider = os.environ.get("EMAIL_PROVIDER", "").strip() or EMAIL_PROVIDER
 
+    # 禁止使用高风险模式
+    BLOCKED_PROVIDERS = ("gmail_alias", "outlook")
+    if email_provider in BLOCKED_PROVIDERS:
+        print(f"❌ email provider '{email_provider}' 已被禁用（高风险: +tag/别名 易被风控识别），仅支持 vps")
+        return
+
     if fixed_account:
-        email_address = fixed_account['email']
-        jwt_token = "OUTLOOK_API"
-        email_provider = "outlook"
-        print(f"📧 使用固定 Outlook 邮箱: {email_address}")
+        print("❌ Outlook 固定账号模式已被禁用（高风险），仅支持 vps")
+        return
     elif TEST_EMAIL:
         email_address = TEST_EMAIL
         jwt_token = ""

@@ -1,8 +1,6 @@
 email:
-  # provider: vps | gmail_alias
-  #   vps        = VPS 自建邮箱 API（metoolbot.top）
-  #   gmail_alias = Gmail 点号/+tag 别名（需配 gmail 节）
-  provider: gmail_alias
+  # provider: vps (仅此模式，gmail_alias 和 outlook 已禁用)
+  provider: vps
 
   # --- VPS 自建邮箱配置 ---
   worker_url: https://mx1.metoolbot.top
@@ -12,13 +10,11 @@ email:
   poll_interval: 5
   admin_password: CHANGE_ME_STRONG_PASSWORD
 
-  # --- Gmail 别名配置 ---
-  gmail:
-    base_user: toojia0510
-    # App Password（16 位，空格分隔）。建议改用环境变量 GMAIL_APP_PASSWORD
-    app_password: "ties zgem pvky ilah"
-    # 别名 tag 长度（仅小写字母+数字，格式: baseuser+{tag}@gmail.com）
-    tag_length: 12
+  # --- Gmail 别名 (已禁用) ---
+  # gmail:
+  #   base_user: ""
+  #   app_password: ""
+  #   tag_length: 12
 
 # 注册流程
 registration:
@@ -32,9 +28,9 @@ browser:
 region:
   current: germany
   device_type: desktop
-  use_proxy: false
+  use_proxy: true
   proxy_mode: static
-  proxy_url: ''
+  proxy_url: "socks5://WMauHktAwcKX:YiLkHvDOJs@70.39.242.6:443"
   proxy_api:
     url: ''
     timeout: 10
