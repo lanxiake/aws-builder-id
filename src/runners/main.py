@@ -37,7 +37,7 @@ def generate_strong_password():
     return password
 
 
-def save_account(email, password, name, jwt_token="", login_verified=None, status=None):
+def save_account(email, password, name, jwt_token="", *, login_verified=None, status="registered"):
     """保存账号信息到文件"""
     if status is None:
         status = "active" if login_verified else "registered"
@@ -50,7 +50,9 @@ def save_account(email, password, name, jwt_token="", login_verified=None, statu
         "login_verified": login_verified,
         "status": status,
     }
-    
+    if login_verified is not None:
+        account_info["login_verified"] = login_verified
+
     file_path = "accounts.json"
     # 改用 JSONL (每行一个 JSON) 追加写入，防止多进程冲突
     file_path = "accounts.jsonl"
