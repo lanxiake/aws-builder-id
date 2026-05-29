@@ -240,3 +240,7 @@ region:
 
 **当前状态**: ✅ 代理API集成完成，可以正常获取IP
 **待解决**: ⚠️  如需要，配置代理认证信息
+
+### 代理商链接
+
+- https://app.ipfoxy.net/buyProxy
